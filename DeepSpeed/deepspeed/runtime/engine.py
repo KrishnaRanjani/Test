@@ -225,8 +225,16 @@ class DeepSpeedEngine(Module):
         self._step_applied = False
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
-
         self.checkpoint_engine = None
+        def __init__(self, args=None, model=None, optimizer=None, model_parameters=None, **kwargs):
+        
+        # Initialize DataStates checkpointing if enabled
+        self.datastates_checkpointing = None
+        if hasattr(self.config, 'checkpoint') and self.config.checkpoint.get('use_datastates', False):
+            from DataStates.checkpointing import Checkpointing
+            datastates_config = self.config.checkpoint.get('datastates_config', {})
+            self.datastates_checkpointing = Checkpointing(datastates_config, rank=self.global_rank)
+                
 
         self._is_gradient_accumulation_boundary = None
         self.scale_wrt_gas = None
@@ -3053,96 +3061,36 @@ class DeepSpeedEngine(Module):
             elif not valid:
                 logger.warning(msg)
 
-    def save_checkpoint(self, save_dir, tag=None, client_state={}, save_latest=True, exclude_frozen_parameters=False):
-        """Save training checkpoint
-
-        Arguments:
-            save_dir: Required. Directory for saving the checkpoint
-            tag: Optional. Checkpoint tag used as a unique identifier for the checkpoint, global step is
-                used if not provided. Tag name must be the same across all ranks.
-            client_state: Optional. State dictionary used for saving required training states in the client code.
-            save_latest: Optional. Save a file 'latest' pointing to the latest saved checkpoint.
-            exclude_frozen_parameters: Optional. Exclude frozen parameters from checkpointed state.
-        Important: all processes must call this method and not just the process with rank 0. It is
-        because each process needs to save its master weights and scheduler+optimizer states. This
-        method will hang waiting to synchronize with other processes if it's called just for the
-        process with rank 0.
-
-        """
-        if self._optimizer_has_ckpt_event_prologue():
-            # Custom preparation for checkpoint save, if applicable
-            self.optimizer.checkpoint_event_prologue()
-
-        rank = self.local_rank if self.use_node_local_storage() else self.global_rank
-
-        # This is to make sure the checkpoint names are created without collision
-        # There seems to be issue creating them in parallel
-
-        # Ensure save_dir directory exists
-        if rank == 0:
-            self.checkpoint_engine.makedirs(save_dir, exist_ok=True)
-        dist.barrier()
-
-        if tag is None:
-            tag = f"global_step{self.global_steps}"
-
-        # Ensure tag is a string
-        tag = str(tag)
-        self.checkpoint_engine.create(tag)
-
-        # Ensure checkpoint tag is consistent across ranks
-        self._checkpoint_tag_validation(tag)
-
-        if self.has_moe_layers:
-            self.save_non_zero_checkpoint = False
-            self._create_checkpoint_file(save_dir, tag, False)
-            self._save_moe_checkpoint(save_dir,
-                                      tag,
-                                      client_state=client_state,
-                                      exclude_frozen_parameters=exclude_frozen_parameters)
-
-        # We distribute the task of saving layer checkpoint files among
-        # data parallel instances, so all procs should call _save_checkpoint.
-        # All procs then call module_state_dict(), but only procs of data
-        # parallel rank 0 save the general model params.
-        if not self.has_moe_layers:
-            self._create_checkpoint_file(save_dir, tag, False)
-            self._save_checkpoint(save_dir,
-                                  tag,
-                                  client_state=client_state,
-                                  exclude_frozen_parameters=exclude_frozen_parameters)
-
-        if self.save_zero_checkpoint:
-            self._create_zero_checkpoint_files(save_dir, tag)
-            self._save_zero_checkpoint(save_dir, tag)
-
-        if self.zero_has_nvme_offload():
-            from shutil import copytree, disk_usage
-            offload_dir = self.optimizer.optimizer_swapper.swap_folder
-            offload_ckpt_dir = os.path.join(save_dir, tag, "offloaded_tensors")
-            _, _, free = disk_usage(save_dir)
-            logger.info(
-                f"Copying NVMe offload files from {offload_dir} to {offload_ckpt_dir}, {free / 1e9:,.2f} GB free on target filesystem..."
-            )
-            copytree(offload_dir,
-                     offload_ckpt_dir,
-                     ignore=lambda _, dir_list: list(filter(lambda x: 'gradient' in x, dir_list)),
-                     dirs_exist_ok=False)
-            _, _, free = disk_usage(save_dir)
-            logger.info(f"Copying complete! {free / 1e9:,.2f} GB free on target filesystem")
-
-        if self._optimizer_has_ckpt_event_epilogue():
-            self.optimizer.checkpoint_event_epilogue()
-
-        # Save latest checkpoint tag
-        self.checkpoint_engine.commit(tag)
-        if save_latest and rank == 0:
-            with open(os.path.join(save_dir, 'latest'), 'w') as fd:
-                fd.write(tag)
-
-        dist.barrier()
-
-        return True
+    def save_checkpoint(self, save_dir, tag, client_state=None, save_latest=True):
+        """Override to use DataStates checkpointing when enabled"""
+        if self.datastates_checkpointing:
+            # Use DataStates checkpointing
+            current_step = self.global_steps
+            state_dict = self._get_checkpoint_state_dict(tag, client_state)
+            
+            # Determine checkpoint type
+            checkpoint_type = self.datastates_checkpointing.should_perform_checkpoint(current_step)
+            
+            if checkpoint_type != "none":
+                result = self.datastates_checkpointing.save(
+                    state_dict=state_dict,
+                    path=f"{save_dir}/{tag}",
+                    current_step=current_step,
+                    model=self.module,
+                    optimizer=self.optimizer,
+                    checkpoint_type=checkpoint_type,
+                    accumulation_steps=self.gradient_accumulation_steps
+                )
+                
+                if result and save_latest:
+                    self._save_latest_checkpoint(save_dir, tag)
+                
+                return result
+            else:
+                return False
+        else:
+            # Use original DeepSpeed checkpointing
+            return super().save_checkpoint(save_dir, tag, client_state, save_latest)
 
     def _get_non_moe_state_dict(self, full_state_dict):
         """

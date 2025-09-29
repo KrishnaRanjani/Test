@@ -115,26 +115,36 @@ class Checkpointing:
         
         return "none"
 
-    def _compute_gradient_norms(self, model):
+    def _compute_gradient_norms(self, model, accumulation_steps=1):
+        """Compute gradient norms with accumulation steps handling"""
         gradient_norms = {}
         if model is not None:
             try:
                 for name, param in model.named_parameters():
                     if param.grad is not None:
-                        gradient_norms[name] = param.grad.norm().item()
+                        # Handle gradient accumulation
+                        if accumulation_steps > 1:
+                            # Create a copy to avoid modifying the original
+                            avg_grad = param.grad.clone() / accumulation_steps
+                            grad_norm = avg_grad.norm().item()
+                        else:
+                            grad_norm = param.grad.norm().item()
+                        gradient_norms[name] = grad_norm
                     else:
                         gradient_norms[name] = 0.0
             except Exception as e:
                 self.logger.error(f"Error computing gradient norms: {e}")
         return gradient_norms
 
-    def _compute_layer_importance(self, model, checkpoint_type):
+    def _compute_layer_importance(self, model, checkpoint_type, accumulation_steps=1):
+        """Compute layer importance with accumulation steps"""
         if model is None:
             self.logger.warning("Model is None, cannot compute layer importance")
             return {}
         
         try:
-            current_grads = self._compute_gradient_norms(model)
+            current_grads = self._compute_gradient_norms(model, accumulation_steps)
+            # ... rest of the function remains the same ...
             
             if checkpoint_type == "full_baseline":
                 layer_baseline = {}
@@ -219,46 +229,58 @@ class Checkpointing:
         return param_mapping
 
     def save_optimizer_state_properly(self, optimizer, model):
-        """FIXED: Save optimizer state using parameter names as stable keys"""
+        """Save optimizer state with ZeRO compatibility"""
         if not optimizer or not model:
             return {}
         
-        # Get the full optimizer state dict
-        opt_state_dict = optimizer.state_dict()
+        # Check if using ZeRO
+        is_zero = hasattr(optimizer, 'parameter_count') and hasattr(optimizer, 'partition_optimizer_state_dict')
         
-        # Create parameter name to index mapping for the CURRENT optimizer
-        param_name_to_idx = {}
-        idx_to_param_name = {}
-        
-        param_idx = 0
-        for group_idx, group in enumerate(optimizer.param_groups):
-            for param in group['params']:
-                # Find parameter name
-                param_name = None
-                for name, model_param in model.named_parameters():
-                    if param is model_param:
-                        param_name = name
-                        break
-                
-                if param_name:
-                    param_name_to_idx[param_name] = param_idx
-                    idx_to_param_name[param_idx] = param_name
-                    param_idx += 1
-        
-        # Convert state dict to use parameter names
-        name_based_state = {
-            'state': {},
-            'param_groups': opt_state_dict['param_groups'],
-            'param_name_mapping': idx_to_param_name
-        }
-        
-        # Convert parameter states to use names
-        for param_idx, state in opt_state_dict['state'].items():
-            if param_idx in idx_to_param_name:
-                param_name = idx_to_param_name[param_idx]
-                name_based_state['state'][param_name] = state
-        
-        return name_based_state
+        if is_zero:
+            # For ZeRO, use DeepSpeed's built-in methods
+            try:
+                return optimizer.state_dict()
+            except Exception as e:
+                self.logger.error(f"Failed to get ZeRO optimizer state: {e}")
+                return {}
+        else:
+            # Original implementation for non-ZeRO cases        
+            # Get the full optimizer state dict
+            opt_state_dict = optimizer.state_dict()
+            
+            # Create parameter name to index mapping for the CURRENT optimizer
+            param_name_to_idx = {}
+            idx_to_param_name = {}
+            
+            param_idx = 0
+            for group_idx, group in enumerate(optimizer.param_groups):
+                for param in group['params']:
+                    # Find parameter name
+                    param_name = None
+                    for name, model_param in model.named_parameters():
+                        if param is model_param:
+                            param_name = name
+                            break
+                    
+                    if param_name:
+                        param_name_to_idx[param_name] = param_idx
+                        idx_to_param_name[param_idx] = param_name
+                        param_idx += 1
+            
+            # Convert state dict to use parameter names
+            name_based_state = {
+                'state': {},
+                'param_groups': opt_state_dict['param_groups'],
+                'param_name_mapping': idx_to_param_name
+            }
+            
+            # Convert parameter states to use names
+            for param_idx, state in opt_state_dict['state'].items():
+                if param_idx in idx_to_param_name:
+                    param_name = idx_to_param_name[param_idx]
+                    name_based_state['state'][param_name] = state
+            
+            return name_based_state
 
     def load_optimizer_state_properly(self, saved_optimizer_state, current_optimizer, current_model):
         """FIXED: Load optimizer state by matching parameter names to current optimizer structure"""
@@ -869,7 +891,8 @@ class Checkpointing:
             self.logger.warning(f"Optimized load failed: {e}, falling back")
             return self._load_fallback(checkpoint_base_dir, model, optimizer)
 
-    def save(self, state_dict, path: str, current_step: int = None, model=None, optimizer=None, resume_step: int = None, checkpoint_type: str = None):
+    def save(self, state_dict, path: str, current_step: int = None, model=None, optimizer=None, resume_step: int = None, checkpoint_type: str = None, accumulation_steps=1):
+        """Save checkpoint with accumulation steps support"""
         try:
             if checkpoint_type is None:
                 checkpoint_type = self.should_perform_checkpoint(current_step, resume_step)
@@ -878,7 +901,7 @@ class Checkpointing:
                 return False
 
             if model is not None:
-                self._compute_layer_importance(model, checkpoint_type)
+                self._compute_layer_importance(model, checkpoint_type, accumulation_steps)
             else:
                 self.logger.warning("Model is None - cannot compute layer importance")
 
