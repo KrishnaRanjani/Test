@@ -11,7 +11,8 @@ import hashlib
 from collections import defaultdict, OrderedDict, deque
 from shutil import copyfile
 import gc
-
+import torch
+import torch.distributed as dist
 from torch.nn.modules import Module
 from torch.nn.parameter import Parameter
 from torch.optim import Optimizer
@@ -3239,8 +3240,31 @@ class DeepSpeedEngine(Module):
             elif not valid:
                 logger.warning(msg)
 
+    def _get_checkpoint_state_dict(self, tag, client_state=None):
+        """Get checkpoint state dict with DataStates support"""
+        state_dict = {
+            'model': self.module.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+            'global_steps': self.global_steps,
+            'global_samples': self.global_samples,
+            'dp_world_size': self.dp_world_size,
+            'mp_world_size': self.mp_world_size,
+            'config': self.config,
+            **(client_state or {})
+        }
+        
+        # Add DataStates metadata if needed
+        if self.datastates_checkpointing:
+            state_dict['datastates_metadata'] = {
+                'layer_importance': self.datastates_checkpointing.layer_importance_scores,
+                'selected_layers': self.datastates_checkpointing.selected_layers_cache
+            }
+        
+        return state_dict
+
     def save_checkpoint(self, save_dir, tag, client_state=None, save_latest=True):
-        """Override to use DataStates checkpointing when enabled"""
+        """Save checkpoint using DataStates if enabled, otherwise use DeepSpeed's method"""
         if self.datastates_checkpointing:
             # Use DataStates checkpointing
             current_step = self.global_steps
@@ -3269,7 +3293,7 @@ class DeepSpeedEngine(Module):
         else:
             # Use original DeepSpeed checkpointing
             return super().save_checkpoint(save_dir, tag, client_state, save_latest)
-    
+
     def _get_checkpoint_state_dict(self, tag, client_state=None):
         """Get checkpoint state dict with DataStates support"""
         state_dict = {
