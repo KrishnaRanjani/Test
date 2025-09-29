@@ -14,10 +14,22 @@ from datastates.ckpt import CkptEngine
 from .helper import parse_config, get_checkpoint_version, HOST_CACHE_SIZE, CKPT_PARSER_THREADS
 from datastates.utils import get_logger
 
+@staticmethod
 def extract_layer_id(param_name):
     """Extract layer ID from parameter name"""
-    if 'layers.' in param_name:
-        parts = param_name.split('.')
+    # Remove tensor parallel suffixes
+    if '_tp' in param_name:
+        base_name = param_name.split('_tp')[0]
+    else:
+        base_name = param_name
+    
+    # Remove pipeline parallel prefixes
+    if base_name.startswith('stage_'):
+        base_name = '.'.join(base_name.split('.')[1:])
+    
+    # Extract layer ID from cleaned name
+    if 'layers.' in base_name:
+        parts = base_name.split('.')
         try:
             layer_idx = parts.index('layers')
             if layer_idx + 1 < len(parts) and parts[layer_idx + 1].isdigit():
@@ -25,9 +37,10 @@ def extract_layer_id(param_name):
         except:
             pass
     
-    if 'embed' in param_name:
+    # Handle special layers
+    if 'embed' in base_name:
         return "embed_tokens"
-    elif 'norm' in param_name or 'lm_head' in param_name:
+    elif 'norm' in base_name or 'lm_head' in base_name:
         return "lm_head"
     else:
         return "other"
@@ -209,6 +222,35 @@ class Checkpointing:
         
         self.logger.info(f"Selected {len(critical_layers)} layers: {sorted(critical_layers)}")
         return critical_layers
+
+    def _update_layer_importance(self, grad_norms):
+        """Update the layer importance scores based on current gradient norms"""
+        # Group gradients by layer ID
+        layer_grads = {}
+        for param_name, norm in grad_norms.items():
+            layer_id = self.extract_layer_id(param_name)
+            if layer_id not in layer_grads:
+                layer_grads[layer_id] = 0.0
+            layer_grads[layer_id] += norm
+        
+        # Update based on training phase
+        if not self.warmup_complete:
+            # During warmup, collect baseline gradients
+            self.baseline_gradients = layer_grads
+        else:
+            # Update current gradients
+            self.current_gradients = layer_grads
+            
+            # Compute importance scores as the difference from baseline
+            importance_scores = {}
+            for layer_id in self.current_gradients:
+                if layer_id in self.baseline_gradients:
+                    diff = abs(self.current_gradients[layer_id] - self.baseline_gradients[layer_id])
+                    importance_scores[layer_id] = diff
+                else:
+                    importance_scores[layer_id] = self.current_gradients[layer_id]
+            
+            self.layer_importance_scores = importance_scores
 
     def create_optimizer_param_mapping(self, model, optimizer):
         """FIXED: Create stable parameter name mapping"""

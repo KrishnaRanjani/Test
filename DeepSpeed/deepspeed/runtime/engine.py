@@ -226,16 +226,6 @@ class DeepSpeedEngine(Module):
         self._global_grad_norm = None
         self.use_ds_comm = False  # False --> Use torch.dist, True --> Use ds.comm backend.
         self.checkpoint_engine = None
-        def __init__(self, args=None, model=None, optimizer=None, model_parameters=None, **kwargs):
-        
-        # Initialize DataStates checkpointing if enabled
-        self.datastates_checkpointing = None
-        if hasattr(self.config, 'checkpoint') and self.config.checkpoint.get('use_datastates', False):
-            from DataStates.checkpointing import Checkpointing
-            datastates_config = self.config.checkpoint.get('datastates_config', {})
-            self.datastates_checkpointing = Checkpointing(datastates_config, rank=self.global_rank)
-                
-
         self._is_gradient_accumulation_boundary = None
         self.scale_wrt_gas = None
         self.losses = None
@@ -245,6 +235,18 @@ class DeepSpeedEngine(Module):
 
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
+
+        # Initialize DataStates checkpointing if enabled
+        self.datastates_checkpointing = None
+        if hasattr(self.config, 'checkpoint') and self.config.checkpoint.get('use_datastates', False):
+            from DataStates.checkpointing import Checkpointing
+            datastates_config = self.config.checkpoint.get('datastates_config', {})
+            self.datastates_checkpointing = Checkpointing(datastates_config, rank=self.global_rank)
+        
+        # Initialize communication groups for 3D parallelism
+        self.comm_groups = self._setup_communication_groups()
+    
+
         self._do_sanity_check()
         see_memory_usage(f"DeepSpeed Engine: After args sanity test", force=self.memory_breakdown())
         if mpu is not None:
@@ -370,6 +372,52 @@ class DeepSpeedEngine(Module):
         self.unflatten = _unflatten_dense_tensors
 
         self._is_compiled = False
+
+    def _setup_communication_groups(self):
+        """Setup communication groups for 3D parallelism"""
+        if not torch.distributed.is_initialized():
+            return None
+        
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        
+        # Get parallel degrees from environment or config
+        tp_degree = int(os.environ.get('TENSOR_PARALLEL_SIZE', 1))
+        pp_degree = int(os.environ.get('PIPELINE_PARALLEL_SIZE', 1))
+        dp_degree = world_size // (tp_degree * pp_degree)
+        
+        # Calculate current rank in each dimension
+        tp_rank = rank % tp_degree
+        pp_rank = (rank // tp_degree) % pp_degree
+        dp_rank = rank // (tp_degree * pp_degree)
+        
+        # Create data parallel group
+        dp_ranks = [i for i in range(world_size) 
+                    if i // (tp_degree * pp_degree) == dp_rank]
+        dp_group = torch.distributed.new_group(ranks=dp_ranks)
+        
+        # Create tensor parallel group
+        tp_ranks = [i for i in range(world_size)
+                    if i % tp_degree == tp_rank]
+        tp_group = torch.distributed.new_group(ranks=tp_ranks)
+        
+        # Create pipeline parallel group
+        pp_ranks = [i for i in range(world_size)
+                    if (i // tp_degree) % pp_degree == pp_rank]
+        pp_group = torch.distributed.new_group(ranks=pp_ranks)
+        
+        return {
+            'world': torch.distributed.distributed_c10d._get_default_group(),
+            'data_parallel': dp_group,
+            'tensor_parallel': tp_group,
+            'pipeline_parallel': pp_group,
+            'tp_degree': tp_degree,
+            'pp_degree': pp_degree,
+            'dp_degree': dp_degree,
+            'tp_rank': tp_rank,
+            'pp_rank': pp_rank,
+            'dp_rank': dp_rank
+        }
 
     def destroy(self):
         if self.optimizer is not None and hasattr(self.optimizer, 'destroy'):
@@ -2010,7 +2058,137 @@ class DeepSpeedEngine(Module):
 
         see_memory_usage("Engine after backward", force=self.memory_breakdown())
 
+        if self.datastates_checkpointing and self.global_steps % self.gradient_accumulation_steps == 0:
+            try:
+                # Compute gradient norms
+                grad_norms = self.datastates_checkpointing._compute_gradient_norms(
+                    self.module, self.gradient_accumulation_steps)
+                
+                # Aggregate across ranks if needed
+                if self.comm_groups:
+                    # First aggregate within tensor parallel group
+                    if self.comm_groups['tensor_parallel'].size() > 1:
+                        grad_norms = self._aggregate_within_group(grad_norms, self.comm_groups['tensor_parallel'])
+                    
+                    # Then aggregate within pipeline parallel group
+                    if self.comm_groups['pipeline_parallel'].size() > 1:
+                        grad_norms = self._aggregate_within_group(grad_norms, self.comm_groups['pipeline_parallel'])
+                    
+                    # Finally aggregate within data parallel group
+                    if self.comm_groups['data_parallel'].size() > 1:
+                        grad_norms = self._aggregate_within_group(grad_norms, self.comm_groups['data_parallel'])
+                
+                # Update layer importance
+                self.datastates_checkpointing._update_layer_importance(grad_norms)
+            except Exception as e:
+                self.logger.warning(f"Failed to compute gradient norms: {e}")
+
         return loss
+
+    def _aggregate_within_group(self, local_norms, group):
+        """Aggregate gradient norms within a specific communication group"""
+        if not torch.distributed.is_initialized() or group.size() <= 1:
+            return local_norms
+        
+        world_size = group.size()
+        
+        # Get all unique layer IDs from all ranks in this group
+        all_layer_ids = set()
+        for param_name in local_norms.keys():
+            layer_id = self.datastates_checkpointing.extract_layer_id(param_name)
+            all_layer_ids.add(layer_id)
+        
+        # Gather all layer IDs from all ranks in this group
+        all_layer_ids_list = list(all_layer_ids)
+        gathered_layer_ids = [None] * world_size
+        
+        # Use all_gather_object to collect layer IDs from all ranks
+        torch.distributed.all_gather_object(gathered_layer_ids, all_layer_ids_list, group=group)
+        
+        # Combine all layer IDs and remove duplicates
+        global_layer_ids = set()
+        for rank_layer_ids in gathered_layer_ids:
+            global_layer_ids.update(rank_layer_ids)
+        global_layer_ids = sorted(list(global_layer_ids))
+        
+        # Create a mapping from layer ID to global index
+        layer_id_to_index = {layer_id: i for i, layer_id in enumerate(global_layer_ids)}
+        
+        # Initialize global norms tensor
+        global_norms_tensor = torch.zeros(len(global_layer_ids), device='cuda')
+        local_norms_tensor = torch.zeros(len(global_layer_ids), device='cuda')
+        
+        # Fill local norms tensor
+        for param_name, norm in local_norms.items():
+            layer_id = self.datastates_checkpointing.extract_layer_id(param_name)
+            if layer_id in layer_id_to_index:
+                local_norms_tensor[layer_id_to_index[layer_id]] = norm
+        
+        # Sum across all ranks in the group
+        torch.distributed.all_reduce(local_norms_tensor, op=torch.distributed.ReduceOp.SUM, group=group)
+        
+        # Average by group size
+        global_norms_tensor = local_norms_tensor / world_size
+        
+        # Convert back to dictionary
+        global_norms = {}
+        for layer_id, index in layer_id_to_index.items():
+            global_norms[layer_id] = global_norms_tensor[index].item()
+        
+        return global_norms
+
+    def _aggregate_gradient_norms(self, local_norms):
+        """Aggregate gradient norms across all ranks using NCCL for 3D parallelism"""
+        if not torch.distributed.is_initialized():
+            return local_norms
+        
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        
+        # Get all unique layer IDs from all ranks
+        all_layer_ids = set()
+        for param_name in local_norms.keys():
+            layer_id = self.datastates_checkpointing.extract_layer_id(param_name)
+            all_layer_ids.add(layer_id)
+        
+        # Gather all layer IDs from all ranks
+        all_layer_ids_list = list(all_layer_ids)
+        gathered_layer_ids = [None] * world_size
+        
+        # Use all_gather_object to collect layer IDs from all ranks
+        torch.distributed.all_gather_object(gathered_layer_ids, all_layer_ids_list)
+        
+        # Combine all layer IDs and remove duplicates
+        global_layer_ids = set()
+        for rank_layer_ids in gathered_layer_ids:
+            global_layer_ids.update(rank_layer_ids)
+        global_layer_ids = sorted(list(global_layer_ids))
+        
+        # Create a mapping from layer ID to global index
+        layer_id_to_index = {layer_id: i for i, layer_id in enumerate(global_layer_ids)}
+        
+        # Initialize global norms tensor
+        global_norms_tensor = torch.zeros(len(global_layer_ids), device='cuda')
+        local_norms_tensor = torch.zeros(len(global_layer_ids), device='cuda')
+        
+        # Fill local norms tensor
+        for param_name, norm in local_norms.items():
+            layer_id = self.datastates_checkpointing.extract_layer_id(param_name)
+            if layer_id in layer_id_to_index:
+                local_norms_tensor[layer_id_to_index[layer_id]] = norm
+        
+        # Sum across all ranks
+        torch.distributed.all_reduce(local_norms_tensor, op=torch.distributed.ReduceOp.SUM)
+        
+        # Average by world size
+        global_norms_tensor = local_norms_tensor / world_size
+        
+        # Convert back to dictionary
+        global_norms = {}
+        for layer_id, index in layer_id_to_index.items():
+            global_norms[layer_id] = global_norms_tensor[index].item()
+        
+        return global_norms
 
     def is_gradient_accumulation_boundary(self):
         """
@@ -3091,6 +3269,37 @@ class DeepSpeedEngine(Module):
         else:
             # Use original DeepSpeed checkpointing
             return super().save_checkpoint(save_dir, tag, client_state, save_latest)
+    
+    def _get_checkpoint_state_dict(self, tag, client_state=None):
+        """Get checkpoint state dict with DataStates support"""
+        state_dict = {
+            'model': self.module.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'lr_scheduler': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+            'global_steps': self.global_steps,
+            'global_samples': self.global_samples,
+            'dp_world_size': self.dp_world_size,
+            'mp_world_size': self.mp_world_size,
+            'config': self.config,
+            **(client_state or {})
+        }
+        
+        # Add DataStates metadata if needed
+        if self.datastates_checkpointing:
+            state_dict['datastates_metadata'] = {
+                'layer_importance': self.datastates_checkpointing.layer_importance_scores,
+                'selected_layers': self.datastates_checkpointing.selected_layers_cache
+            }
+        
+        return state_dict
+
+    def _save_latest_checkpoint(self, save_dir, tag):
+        """Save the latest checkpoint tag"""
+        try:
+            with open(os.path.join(save_dir, 'latest'), 'w') as f:
+                f.write(tag)
+        except Exception as e:
+            self.logger.warning(f"Failed to save latest checkpoint tag: {e}")
 
     def _get_non_moe_state_dict(self, full_state_dict):
         """
